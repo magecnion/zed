@@ -5,7 +5,7 @@ use client::{TypedEnvelope, proto};
 use collections::{HashMap, HashSet};
 use extension::{
     Extension, ExtensionDebugAdapterProviderProxy, ExtensionHostProxy, ExtensionLanguageProxy,
-    ExtensionLanguageServerProxy, ExtensionManifest,
+    ExtensionLanguageServerProxy,ExtensionManifestKind
 };
 use fs::{Fs, RemoveOptions, RenameOptions};
 use futures::future::join_all;
@@ -14,7 +14,6 @@ use http_client::HttpClient;
 use language::{LanguageConfig, LanguageName, LanguageQueries, LoadedLanguage};
 use lsp::LanguageServerName;
 use node_runtime::NodeRuntime;
-
 use crate::wasm_host::{WasmExtension, WasmHost};
 
 #[derive(Clone, Debug)]
@@ -124,19 +123,19 @@ impl HeadlessExtensionStore {
             )
         })?;
 
-        let manifest = Arc::new(ExtensionManifest::load(fs.clone(), &extension_dir).await?);
+        let manifest = Arc::new(ExtensionManifestKind::load(fs.clone(), &extension_dir).await?);
 
-        debug_assert!(!manifest.languages.is_empty() || manifest.allow_remote_load());
+        debug_assert!(!manifest.common().languages.is_empty() || manifest.common().allow_remote_load());
 
-        if manifest.version.as_ref() != extension.version.as_str() {
+        if manifest.common().version.as_ref() != extension.version.as_str() {
             anyhow::bail!(
                 "mismatched versions: ({}) != ({})",
-                manifest.version,
+                manifest.common().version,
                 extension.version
             )
         }
 
-        for language_path in &manifest.languages {
+        for language_path in &manifest.common().languages {
             let language_path = extension_dir.join(language_path);
             let config = fs
                 .load(&language_path.join(LanguageConfig::FILE_NAME))
@@ -145,7 +144,7 @@ impl HeadlessExtensionStore {
 
             this.update(cx, |this, _cx| {
                 this.loaded_languages
-                    .entry(manifest.id.clone())
+                    .entry(manifest.common().id.clone())
                     .or_default()
                     .push(config.name.clone());
 
@@ -169,18 +168,18 @@ impl HeadlessExtensionStore {
             })?;
         }
 
-        if !manifest.allow_remote_load() {
+        if !manifest.common().allow_remote_load() {
             return Ok(());
         }
 
         let wasm_extension: Arc<dyn Extension> =
             Arc::new(WasmExtension::load(&extension_dir, &manifest, wasm_host.clone(), cx).await?);
 
-        for (language_server_id, language_server_config) in &manifest.language_servers {
+        for (language_server_id, language_server_config) in &manifest.common().language_servers {
             for language in language_server_config.languages() {
                 this.update(cx, |this, _cx| {
                     this.loaded_language_servers
-                        .entry(manifest.id.clone())
+                        .entry(manifest.common().id.clone())
                         .or_default()
                         .push((language_server_id.clone(), language.clone()));
                     this.proxy.register_language_server(
@@ -193,7 +192,7 @@ impl HeadlessExtensionStore {
             log::info!("Loaded language server: {}", language_server_id);
         }
 
-        for (debug_adapter, meta) in &manifest.debug_adapters {
+        for (debug_adapter, meta) in &manifest.common().debug_adapters {
             let schema_path = extension::build_debug_adapter_schema_path(debug_adapter, meta);
 
             this.update(cx, |this, _cx| {
@@ -206,7 +205,7 @@ impl HeadlessExtensionStore {
             log::info!("Loaded debug adapter: {}", debug_adapter);
         }
 
-        for debug_locator in manifest.debug_locators.keys() {
+        for debug_locator in manifest.common().debug_locators.keys() {
             this.update(cx, |this, _cx| {
                 this.proxy
                     .register_debug_locator(wasm_extension.clone(), debug_locator.clone());

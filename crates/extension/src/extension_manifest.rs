@@ -100,8 +100,6 @@ pub struct ExtensionManifest {
     #[serde(default)]
     pub languages: Vec<PathBuf>,
     #[serde(default)]
-    pub grammars: BTreeMap<Arc<str>, GrammarManifestEntry>,
-    #[serde(default)]
     pub language_servers: BTreeMap<LanguageServerName, LanguageServerManifestEntry>,
     #[serde(default)]
     pub context_servers: BTreeMap<Arc<str>, ContextServerManifestEntry>,
@@ -121,6 +119,64 @@ pub struct ExtensionManifest {
     pub language_model_providers: BTreeMap<Arc<str>, LanguageModelProviderManifestEntry>,
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+pub struct ProdExtensionManifest {
+    #[serde(flatten)]
+    pub common: ExtensionManifest,
+    #[serde(default)]
+    pub grammars: BTreeMap<Arc<str>, GrammarManifestEntry>,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+pub struct DevExtensionManifest {
+    #[serde(flatten)]
+    pub common: ExtensionManifest,
+    #[serde(default)]
+    pub grammars: BTreeMap<Arc<str>, DevGrammarManifestEntry>,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum ExtensionManifestKind {
+    Prod(ProdExtensionManifest),
+    Dev(DevExtensionManifest),
+}
+
+impl ExtensionManifestKind {
+    pub fn common(&self) -> &ExtensionManifest {
+        match self {
+            Self::Prod(m) => &m.common,
+            Self::Dev(m) => &m.common,
+        }
+    }
+
+    pub fn common_mut(&mut self) -> &mut ExtensionManifest {
+        match self {
+            Self::Prod(m) => &mut m.common,
+            Self::Dev(m) => &mut m.common,
+        }
+    }
+
+    pub fn grammar_names(&self) -> Box<dyn Iterator<Item = &Arc<str>> + '_> {
+           match self {
+               Self::Prod(manifest) => Box::new(manifest.grammars.keys()),
+               Self::Dev(manifest) => Box::new(manifest.grammars.keys()),
+           }
+       }
+
+    pub fn provides(&self) -> BTreeSet<ExtensionProvides> {
+        let mut provides = self.common().provides();
+        // TODO
+        // match self {
+        //            Self::Prod(manifest) => !manifest.grammars.is_empty(),
+        //            Self::Dev(manifest) => !manifest.grammars.is_empty(),
+        //        }
+        //     provides.insert(ExtensionProvides::Grammars);
+        // }
+        provides
+    }
+}
+
 impl ExtensionManifest {
     /// Returns the set of features provided by the extension.
     pub fn provides(&self) -> BTreeSet<ExtensionProvides> {
@@ -135,10 +191,6 @@ impl ExtensionManifest {
 
         if !self.languages.is_empty() {
             provides.insert(ExtensionProvides::Languages);
-        }
-
-        if !self.grammars.is_empty() {
-            provides.insert(ExtensionProvides::Grammars);
         }
 
         if !self.language_servers.is_empty() {
@@ -308,6 +360,11 @@ pub struct GrammarManifestEntry {
 }
 
 #[derive(Clone, Default, PartialEq, Eq, Debug, Deserialize, Serialize)]
+pub struct DevGrammarManifestEntry {
+    pub path: String,
+}
+
+#[derive(Clone, Default, PartialEq, Eq, Debug, Deserialize, Serialize)]
 pub struct LanguageServerManifestEntry {
     /// Deprecated in favor of `languages`.
     #[serde(default)]
@@ -366,7 +423,7 @@ pub struct LanguageModelProviderManifestEntry {
     pub icon: Option<String>,
 }
 
-impl ExtensionManifest {
+impl ExtensionManifestKind {
     pub async fn load(fs: Arc<dyn Fs>, extension_dir: &Path) -> Result<Self> {
         let extension_name = extension_dir
             .file_name()
@@ -388,55 +445,95 @@ impl ExtensionManifest {
                 format!("loading {extension_name} extension.json, {extension_manifest_path:?}")
             })?;
 
-            serde_json::from_str::<OldExtensionManifest>(&manifest_content)
+            let prod_manifest = serde_json::from_str::<OldExtensionManifest>(&manifest_content)
                 .with_context(|| format!("invalid extension.json for extension {extension_name}"))
-                .map(|manifest_json| manifest_from_old_manifest(manifest_json, extension_name))
+                .map(|manifest_json| {
+                    prod_manifest_from_old_manifest(manifest_json, extension_name)
+                })?;
+
+            // OldExtensionManifest doesn't support dev extension
+            Ok(ExtensionManifestKind::Prod(prod_manifest))
         } else {
             anyhow::bail!("No extension manifest found for extension {extension_name}")
         }
     }
+
+    pub fn requires_release(&self) -> bool {
+        match self {
+            Self::Prod(_) => true,
+            Self::Dev(_) => false,
+        }
+    }
+    pub fn is_dev(&self) -> bool {
+        match self {
+            Self::Prod(_) => false,
+            Self::Dev(_) => true,
+        }
+    }
+
+    pub fn require_prod(&self) -> Result<&ProdExtensionManifest> {
+            match self {
+                Self::Prod(prod) => Ok(prod),
+                Self::Dev(_) => anyhow::bail!("dev manifest not allowed here"),
+            }
+        }
+    pub fn require_prod_mut(&mut self) -> Result<&mut ProdExtensionManifest> {
+            match self {
+                Self::Prod(prod) => Ok(prod),
+                Self::Dev(_) => anyhow::bail!("dev manifest not allowed here"),
+            }
+        }
+
+    pub fn is_grammars_empty(&self) -> bool {
+            match self {
+                Self::Prod(prod) => prod.grammars.is_empty(),
+                Self::Dev(dev) => dev.grammars.is_empty(),
+            }
+    }
 }
 
-fn manifest_from_old_manifest(
+fn prod_manifest_from_old_manifest(
     manifest_json: OldExtensionManifest,
     extension_id: &str,
-) -> ExtensionManifest {
-    ExtensionManifest {
-        id: extension_id.into(),
-        name: manifest_json.name,
-        version: manifest_json.version,
-        description: manifest_json.description,
-        repository: manifest_json.repository,
-        authors: manifest_json.authors,
-        schema_version: SchemaVersion::ZERO,
-        lib: Default::default(),
-        themes: {
-            let mut themes = manifest_json.themes.into_values().collect::<Vec<_>>();
-            themes.sort();
-            themes.dedup();
-            themes
-        },
-        icon_themes: Vec::new(),
-        languages: {
-            let mut languages = manifest_json.languages.into_values().collect::<Vec<_>>();
-            languages.sort();
-            languages.dedup();
-            languages
+) -> ProdExtensionManifest {
+    ProdExtensionManifest {
+        common: ExtensionManifest {
+            id: extension_id.into(),
+            name: manifest_json.name,
+            version: manifest_json.version,
+            description: manifest_json.description,
+            repository: manifest_json.repository,
+            authors: manifest_json.authors,
+            schema_version: SchemaVersion::ZERO,
+            lib: Default::default(),
+            themes: {
+                let mut themes = manifest_json.themes.into_values().collect::<Vec<_>>();
+                themes.sort();
+                themes.dedup();
+                themes
+            },
+            icon_themes: Vec::new(),
+            languages: {
+                let mut languages = manifest_json.languages.into_values().collect::<Vec<_>>();
+                languages.sort();
+                languages.dedup();
+                languages
+            },
+            language_servers: Default::default(),
+            context_servers: BTreeMap::default(),
+            agent_servers: BTreeMap::default(),
+            slash_commands: BTreeMap::default(),
+            snippets: None,
+            capabilities: Vec::new(),
+            debug_adapters: Default::default(),
+            debug_locators: Default::default(),
+            language_model_providers: Default::default(),
         },
         grammars: manifest_json
             .grammars
             .into_keys()
             .map(|grammar_name| (grammar_name, Default::default()))
             .collect(),
-        language_servers: Default::default(),
-        context_servers: BTreeMap::default(),
-        agent_servers: BTreeMap::default(),
-        slash_commands: BTreeMap::default(),
-        snippets: None,
-        capabilities: Vec::new(),
-        debug_adapters: Default::default(),
-        debug_locators: Default::default(),
-        language_model_providers: Default::default(),
     }
 }
 
@@ -447,6 +544,8 @@ mod tests {
     use crate::ProcessExecCapability;
 
     use super::*;
+
+    // TODO kind?
 
     fn extension_manifest() -> ExtensionManifest {
         ExtensionManifest {
@@ -461,7 +560,6 @@ mod tests {
             themes: vec![],
             icon_themes: vec![],
             languages: vec![],
-            grammars: BTreeMap::default(),
             language_servers: BTreeMap::default(),
             context_servers: BTreeMap::default(),
             agent_servers: BTreeMap::default(),

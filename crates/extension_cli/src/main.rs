@@ -8,7 +8,7 @@ use ::fs::{CopyOptions, Fs, RealFs, copy_recursive};
 use anyhow::{Context as _, Result, anyhow, bail};
 use clap::Parser;
 use extension::extension_builder::{CompileExtensionOptions, ExtensionBuilder};
-use extension::{ExtensionManifest, ExtensionSnippets};
+use extension::{ExtensionManifest, ExtensionSnippets, ExtensionManifestKind};
 use language::LanguageConfig;
 use reqwest_client::ReqwestClient;
 use settings_content::SemanticTokenRules;
@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
     };
 
     log::info!("loading extension manifest");
-    let mut manifest = ExtensionManifest::load(fs.clone(), &extension_path).await?;
+    let mut manifest = ExtensionManifestKind::load(fs.clone(), &extension_path).await?;
 
     log::info!("compiling extension");
 
@@ -110,15 +110,15 @@ async fn main() -> Result<()> {
     }
 
     let manifest_json = serde_json::to_string(&cloud_api_types::ExtensionApiManifest {
-        name: manifest.name,
-        version: manifest.version,
-        description: manifest.description,
-        authors: manifest.authors,
-        schema_version: Some(manifest.schema_version.0),
-        repository: manifest
-            .repository
+        name: manifest.common().name.clone(),
+        version: manifest.common().version.clone(),
+        description: manifest.common().description.clone(),
+        authors: manifest.common().authors.clone(),
+        schema_version: Some(manifest.common().schema_version.0),
+        repository: manifest.common()
+            .repository.clone()
             .context("missing repository in extension manifest")?,
-        wasm_api_version: manifest.lib.version.map(|version| version.to_string()),
+        wasm_api_version: manifest.common().lib.version.clone().map(|version| version.to_string()),
         provides: extension_provides,
     })?;
     fs::remove_dir_all(&archive_dir)?;
@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
 }
 
 async fn copy_extension_resources(
-    manifest: &ExtensionManifest,
+    manifest: &ExtensionManifestKind,
     extension_path: &Path,
     output_dir: &Path,
     fs: Arc<dyn Fs>,
@@ -139,7 +139,7 @@ async fn copy_extension_resources(
     fs::write(output_dir.join("extension.toml"), &manifest_toml)
         .context("failed to write extension.toml")?;
 
-    if manifest.lib.kind.is_some() {
+    if manifest.common().lib.kind.is_some() {
         fs::copy(
             extension_path.join("extension.wasm"),
             output_dir.join("extension.wasm"),
@@ -147,11 +147,11 @@ async fn copy_extension_resources(
         .context("failed to copy extension.wasm")?;
     }
 
-    if !manifest.grammars.is_empty() {
+    if !manifest.is_grammars_empty() {
         let source_grammars_dir = extension_path.join("grammars");
         let output_grammars_dir = output_dir.join("grammars");
         fs::create_dir_all(&output_grammars_dir)?;
-        for grammar_name in manifest.grammars.keys() {
+        for grammar_name in manifest.grammar_names() {
             let mut grammar_filename = PathBuf::from(grammar_name.as_ref());
             grammar_filename.set_extension("wasm");
             fs::copy(
@@ -162,10 +162,10 @@ async fn copy_extension_resources(
         }
     }
 
-    if !manifest.themes.is_empty() {
+    if !manifest.common().themes.is_empty() {
         let output_themes_dir = output_dir.join("themes");
         fs::create_dir_all(&output_themes_dir)?;
-        for theme_path in &manifest.themes {
+        for theme_path in &manifest.common().themes {
             fs::copy(
                 extension_path.join(theme_path),
                 output_themes_dir.join(theme_path.file_name().context("invalid theme path")?),
@@ -174,10 +174,10 @@ async fn copy_extension_resources(
         }
     }
 
-    if !manifest.icon_themes.is_empty() {
+    if !manifest.common().icon_themes.is_empty() {
         let output_icon_themes_dir = output_dir.join("icon_themes");
         fs::create_dir_all(&output_icon_themes_dir)?;
-        for icon_theme_path in &manifest.icon_themes {
+        for icon_theme_path in &manifest.common().icon_themes {
             fs::copy(
                 extension_path.join(icon_theme_path),
                 output_icon_themes_dir.join(
@@ -206,7 +206,7 @@ async fn copy_extension_resources(
         .with_context(|| "failed to copy icons")?;
     }
 
-    for (_, agent_entry) in &manifest.agent_servers {
+    for (_, agent_entry) in &manifest.common().agent_servers {
         if let Some(icon_path) = &agent_entry.icon {
             let source_icon = extension_path.join(icon_path);
             let dest_icon = output_dir.join(icon_path);
@@ -221,10 +221,10 @@ async fn copy_extension_resources(
         }
     }
 
-    if !manifest.languages.is_empty() {
+    if !manifest.common().languages.is_empty() {
         let output_languages_dir = output_dir.join("languages");
         fs::create_dir_all(&output_languages_dir)?;
-        for language_path in &manifest.languages {
+        for language_path in &manifest.common().languages {
             copy_recursive(
                 fs.as_ref(),
                 &extension_path.join(language_path),
@@ -242,8 +242,8 @@ async fn copy_extension_resources(
         }
     }
 
-    if !manifest.debug_adapters.is_empty() {
-        for (debug_adapter, entry) in &manifest.debug_adapters {
+    if !manifest.common().debug_adapters.is_empty() {
+        for (debug_adapter, entry) in &manifest.common().debug_adapters {
             let schema_path = entry.schema_path.clone().unwrap_or_else(|| {
                 PathBuf::from("debug_adapter_schemas".to_owned())
                     .join(debug_adapter.as_ref())
@@ -272,7 +272,7 @@ async fn copy_extension_resources(
         }
     }
 
-    if let Some(snippets) = manifest.snippets.as_ref() {
+    if let Some(snippets) = manifest.common().snippets.as_ref() {
         for snippets_path in snippets.paths() {
             let parent = snippets_path.parent();
             if let Some(parent) = parent.filter(|p| p.components().next().is_some()) {
@@ -298,14 +298,14 @@ async fn copy_extension_resources(
 }
 
 fn test_grammars(
-    manifest: &ExtensionManifest,
+    manifest: &ExtensionManifestKind,
     extension_path: &Path,
     wasm_store: &mut WasmStore,
 ) -> Result<HashMap<String, Language>> {
     let mut grammars = HashMap::default();
     let grammars_dir = extension_path.join("grammars");
 
-    for grammar_name in manifest.grammars.keys() {
+    for grammar_name in manifest.grammar_names() {
         let mut grammar_path = grammars_dir.join(grammar_name.as_ref());
         grammar_path.set_extension("wasm");
 
@@ -319,11 +319,11 @@ fn test_grammars(
 }
 
 fn test_languages(
-    manifest: &ExtensionManifest,
+    manifest: &ExtensionManifestKind,
     extension_path: &Path,
     grammars: &HashMap<String, Language>,
 ) -> Result<()> {
-    for relative_language_dir in &manifest.languages {
+    for relative_language_dir in &manifest.common().languages {
         let language_dir = extension_path.join(relative_language_dir);
         let config_path = language_dir.join(LanguageConfig::FILE_NAME);
         let config = LanguageConfig::load(&config_path)?;
@@ -392,11 +392,11 @@ fn test_languages(
 }
 
 async fn test_themes(
-    manifest: &ExtensionManifest,
+    manifest: &ExtensionManifestKind,
     extension_path: &Path,
     fs: Arc<dyn Fs>,
 ) -> Result<()> {
-    for relative_theme_path in &manifest.themes {
+    for relative_theme_path in &manifest.common().themes {
         let theme_path = extension_path.join(relative_theme_path);
         let theme_family = theme::read_user_theme(&theme_path, fs.clone()).await?;
         log::info!("loaded theme family {}", theme_family.name);
@@ -420,11 +420,11 @@ async fn test_themes(
 }
 
 async fn test_snippets(
-    manifest: &ExtensionManifest,
+    manifest: &ExtensionManifestKind,
     extension_path: &Path,
     fs: Arc<dyn Fs>,
 ) -> Result<()> {
-    for relative_snippet_path in manifest
+    for relative_snippet_path in manifest.common()
         .snippets
         .as_ref()
         .map(ExtensionSnippets::paths)

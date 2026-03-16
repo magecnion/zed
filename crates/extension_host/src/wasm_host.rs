@@ -1,7 +1,7 @@
 pub mod wit;
 
 use crate::capability_granter::CapabilityGranter;
-use crate::{ExtensionManifest, ExtensionSettings};
+use crate::{ExtensionManifest, ExtensionSettings,ExtensionManifestKind};
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
 use dap::{DebugRequest, StartDebuggingRequestArgumentsRequest};
@@ -530,7 +530,7 @@ impl extension::Extension for WasmExtension {
 }
 
 pub struct WasmState {
-    manifest: Arc<ExtensionManifest>,
+    manifest: Arc<ExtensionManifestKind>,
     pub table: ResourceTable,
     ctx: wasi::WasiCtx,
     pub host: Arc<WasmHost>,
@@ -633,7 +633,7 @@ impl WasmHost {
     pub fn load_extension(
         self: &Arc<Self>,
         wasm_bytes: Vec<u8>,
-        manifest: &Arc<ExtensionManifest>,
+        manifest: &Arc<ExtensionManifestKind>,
         cx: &AsyncApp,
     ) -> Task<Result<WasmExtension>> {
         let this = self.clone();
@@ -643,7 +643,7 @@ impl WasmHost {
         // Parse version and compile component on gpui's background executor.
         // These are cpu-bound operations that don't require a tokio runtime.
         let compile_task = {
-            let manifest_id = manifest.id.clone();
+            let manifest_id = manifest.common().id.clone();
             let engine = this.engine.clone();
 
             executor.spawn(async move {
@@ -698,7 +698,7 @@ impl WasmHost {
             anyhow::Ok((
                 extension_task,
                 manifest.clone(),
-                this.work_dir.join(manifest.id.as_ref()).into(),
+                this.work_dir.join(manifest.common().id.as_ref()).into(),
                 tx,
                 zed_api_version,
             ))
@@ -726,8 +726,8 @@ impl WasmHost {
         })
     }
 
-    async fn build_wasi_ctx(&self, manifest: &Arc<ExtensionManifest>) -> Result<wasi::WasiCtx> {
-        let extension_work_dir = self.work_dir.join(manifest.id.as_ref());
+    async fn build_wasi_ctx(&self, manifest: &Arc<ExtensionManifestKind>) -> Result<wasi::WasiCtx> {
+        let extension_work_dir = self.work_dir.join(manifest.common().id.as_ref());
         self.fs
             .create_dir(&extension_work_dir)
             .await
@@ -846,7 +846,7 @@ fn parse_wasm_extension_version_custom_section(data: &[u8]) -> Option<Version> {
 impl WasmExtension {
     pub async fn load(
         extension_dir: &Path,
-        manifest: &Arc<ExtensionManifest>,
+        manifest: &Arc<ExtensionManifestKind>,
         wasm_host: Arc<WasmHost>,
         cx: &AsyncApp,
     ) -> Result<Self> {
@@ -866,7 +866,7 @@ impl WasmExtension {
         wasm_host
             .load_extension(wasm_bytes, manifest, cx)
             .await
-            .with_context(|| format!("loading wasm extension: {}", manifest.id))
+            .with_context(|| format!("loading wasm extension: {}", manifest.common().id))
     }
 
     pub async fn call<T, Fn>(&self, f: Fn) -> Result<T>

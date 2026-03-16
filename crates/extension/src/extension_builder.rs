@@ -1,6 +1,6 @@
 use crate::{
-    ExtensionLibraryKind, ExtensionManifest, GrammarManifestEntry, build_debug_adapter_schema_path,
-    parse_wasm_extension_version,
+    ExtensionLibraryKind, ExtensionManifestKind, GrammarManifestEntry,
+    build_debug_adapter_schema_path, parse_wasm_extension_version,
 };
 use ::fs::Fs;
 use anyhow::{Context as _, Result, bail};
@@ -83,7 +83,7 @@ impl ExtensionBuilder {
     pub async fn compile_extension(
         &self,
         extension_dir: &Path,
-        extension_manifest: &mut ExtensionManifest,
+        extension_manifest: &mut ExtensionManifestKind,
         options: CompileExtensionOptions,
         fs: Arc<dyn Fs>,
     ) -> Result<()> {
@@ -98,7 +98,7 @@ impl ExtensionBuilder {
 
         fs::create_dir_all(&self.cache_dir).context("failed to create cache dir")?;
 
-        if extension_manifest.lib.kind == Some(ExtensionLibraryKind::Rust) {
+        if extension_manifest.common().lib.kind == Some(ExtensionLibraryKind::Rust) {
             log::info!("compiling Rust extension {}", extension_dir.display());
             self.compile_rust_extension(extension_dir, extension_manifest, options)
                 .await
@@ -106,7 +106,7 @@ impl ExtensionBuilder {
             log::info!("compiled Rust extension {}", extension_dir.display());
         }
 
-        for (debug_adapter_name, meta) in &mut extension_manifest.debug_adapters {
+        for (debug_adapter_name, meta) in &mut extension_manifest.common_mut().debug_adapters {
             let debug_adapter_schema_path =
                 extension_dir.join(build_debug_adapter_schema_path(debug_adapter_name, meta));
 
@@ -118,7 +118,8 @@ impl ExtensionBuilder {
                 format!("Debug adapter schema for `{debug_adapter_name}` (path: `{debug_adapter_schema_path:?}`) is not a valid JSON")
             })?;
         }
-        for (grammar_name, grammar_metadata) in &extension_manifest.grammars {
+
+        for grammar_name in extension_manifest.grammar_names() {
             let snake_cased_grammar_name = grammar_name.to_snake_case();
             if grammar_name.as_ref() != snake_cased_grammar_name.as_str() {
                 bail!(
@@ -126,11 +127,31 @@ impl ExtensionBuilder {
                 );
             }
 
+            let mut grammar_repo_dir = extension_dir.to_path_buf();
+            grammar_repo_dir.extend(["grammars", grammar_name]);
+
+            let mut grammar_wasm_path = grammar_repo_dir.clone();
+            grammar_wasm_path.set_extension("wasm");
+            let src_path = match &extension_manifest {
+                ExtensionManifestKind::Dev(_) => {
+                    bail!("")
+                    // TODO swtich if dev or prod
+                }
+                ExtensionManifestKind::Prod(prod_manifest) => {
+                    log::info!("fetching out {grammar_name} parser");
+                    self.fetch_remote_grammar(
+                        grammar_repo_dir,
+                        prod_manifest.grammars.get(grammar_name.as_ref()).unwrap(), // TODO
+                    )
+                    .await?
+                }
+            };
+
             log::info!(
                 "compiling grammar {grammar_name} for extension {}",
                 extension_dir.display()
             );
-            self.compile_grammar(extension_dir, grammar_name.as_ref(), grammar_metadata)
+            self.compile_grammar(grammar_name.as_ref(), src_path, grammar_wasm_path)
                 .await
                 .with_context(|| format!("failed to compile grammar '{grammar_name}'"))?;
             log::info!(
@@ -146,7 +167,7 @@ impl ExtensionBuilder {
     async fn compile_rust_extension(
         &self,
         extension_dir: &Path,
-        manifest: &mut ExtensionManifest,
+        manifest: &mut ExtensionManifestKind,
         options: CompileExtensionOptions,
     ) -> anyhow::Result<()> {
         self.install_rust_wasm_target_if_needed().await?;
@@ -207,9 +228,9 @@ impl ExtensionBuilder {
             .context("failed to strip debug sections from wasm component")?;
 
         let wasm_extension_api_version =
-            parse_wasm_extension_version(&manifest.id, &component_bytes)
+            parse_wasm_extension_version(&manifest.common().id, &component_bytes)
                 .context("compiled wasm did not contain a valid zed extension api version")?;
-        manifest.lib.version = Some(wasm_extension_api_version);
+        manifest.common_mut().lib.version = Some(wasm_extension_api_version);
 
         let extension_file = extension_dir.join("extension.wasm");
         fs::write(extension_file.clone(), &component_bytes)
@@ -224,21 +245,15 @@ impl ExtensionBuilder {
         Ok(())
     }
 
-    async fn compile_grammar(
+    // async fn fetch_local_grammar() -> Result<()> {
+    //     // TODO
+    // }
+
+    async fn fetch_remote_grammar(
         &self,
-        extension_dir: &Path,
-        grammar_name: &str,
+        grammar_repo_dir: PathBuf,
         grammar_metadata: &GrammarManifestEntry,
-    ) -> Result<()> {
-        let clang_path = self.install_wasi_sdk_if_needed().await?;
-
-        let mut grammar_repo_dir = extension_dir.to_path_buf();
-        grammar_repo_dir.extend(["grammars", grammar_name]);
-
-        let mut grammar_wasm_path = grammar_repo_dir.clone();
-        grammar_wasm_path.set_extension("wasm");
-
-        log::info!("checking out {grammar_name} parser");
+    ) -> Result<PathBuf> {
         self.checkout_repo(
             &grammar_repo_dir,
             &grammar_metadata.repository,
@@ -252,7 +267,16 @@ impl ExtensionBuilder {
             .map(|path| grammar_repo_dir.join(path))
             .unwrap_or(grammar_repo_dir);
 
-        let src_path = base_grammar_path.join("src");
+        Ok(base_grammar_path.join("src"))
+    }
+
+    async fn compile_grammar(
+        &self,
+        grammar_name: &str,
+        src_path: PathBuf,
+        grammar_wasm_path: PathBuf,
+    ) -> Result<()> {
+        let clang_path = self.install_wasi_sdk_if_needed().await?;
         let parser_path = src_path.join("parser.c");
         let scanner_path = src_path.join("scanner.c");
 
@@ -558,21 +582,22 @@ impl ExtensionBuilder {
 }
 
 async fn populate_defaults(
-    manifest: &mut ExtensionManifest,
+    manifest: &mut ExtensionManifestKind,
     extension_path: &Path,
     fs: Arc<dyn Fs>,
 ) -> Result<()> {
     // For legacy extensions on the v0 schema (aka, using `extension.json`), clear out any existing
     // contents of the computed fields, since we don't care what the existing values are.
-    if manifest.schema_version.is_v0() {
-        manifest.languages.clear();
-        manifest.grammars.clear();
-        manifest.themes.clear();
+    if manifest.common().schema_version.is_v0() {
+    // let mut prod_manifest = manifest.require_prod_mut()?;
+        manifest.require_prod_mut()?.common.languages.clear();
+        manifest.require_prod_mut()?.grammars.clear();
+        manifest.require_prod_mut()?.common.themes.clear();
     }
 
     let cargo_toml_path = extension_path.join("Cargo.toml");
     if cargo_toml_path.exists() {
-        manifest.lib.kind = Some(ExtensionLibraryKind::Rust);
+        manifest.common_mut().lib.kind = Some(ExtensionLibraryKind::Rust);
     }
 
     let languages_dir = extension_path.join("languages");
@@ -588,8 +613,8 @@ async fn populate_defaults(
             if fs.is_file(config_path.as_path()).await {
                 let relative_language_dir =
                     language_dir.strip_prefix(extension_path)?.to_path_buf();
-                if !manifest.languages.contains(&relative_language_dir) {
-                    manifest.languages.push(relative_language_dir);
+                if !manifest.common().languages.contains(&relative_language_dir) {
+                    manifest.common_mut().languages.push(relative_language_dir);
                 }
             }
         }
@@ -606,8 +631,8 @@ async fn populate_defaults(
             let theme_path = theme_path?;
             if theme_path.extension() == Some("json".as_ref()) {
                 let relative_theme_path = theme_path.strip_prefix(extension_path)?.to_path_buf();
-                if !manifest.themes.contains(&relative_theme_path) {
-                    manifest.themes.push(relative_theme_path);
+                if !manifest.common().themes.contains(&relative_theme_path) {
+                    manifest.common_mut().themes.push(relative_theme_path);
                 }
             }
         }
@@ -625,22 +650,27 @@ async fn populate_defaults(
             if icon_theme_path.extension() == Some("json".as_ref()) {
                 let relative_icon_theme_path =
                     icon_theme_path.strip_prefix(extension_path)?.to_path_buf();
-                if !manifest.icon_themes.contains(&relative_icon_theme_path) {
-                    manifest.icon_themes.push(relative_icon_theme_path);
+                if !manifest
+                    .common()
+                    .icon_themes
+                    .contains(&relative_icon_theme_path)
+                {
+                    manifest.common_mut().icon_themes.push(relative_icon_theme_path);
                 }
             }
         }
     };
-    if manifest.snippets.is_none()
+    if manifest.common().snippets.is_none()
         && let snippets_json_path = extension_path.join("snippets.json")
         && fs.is_file(&snippets_json_path).await
     {
-        manifest.snippets = Some("snippets.json".into());
+        manifest.common_mut().snippets = Some("snippets.json".into());
     }
 
     // For legacy extensions on the v0 schema (aka, using `extension.json`), we want to populate the grammars in
     // the manifest using the contents of the `grammars` directory.
-    if manifest.schema_version.is_v0() {
+    if manifest.common().schema_version.is_v0() {
+        let manifest = manifest.require_prod_mut()?;
         let grammars_dir = extension_path.join("grammars");
         if fs.is_dir(&grammars_dir).await {
             let mut grammar_dir_entries = fs
@@ -784,7 +814,7 @@ mod tests {
         )
         .await;
 
-        let mut manifest = ExtensionManifest::load(fs.clone(), extension_path)
+        let mut manifest = ExtensionManifestKind::load(fs.clone(), extension_path)
             .await
             .unwrap();
 
@@ -821,7 +851,7 @@ mod tests {
         )
         .await;
 
-        let mut manifest = ExtensionManifest::load(fs.clone(), extension_path)
+        let mut manifest = ExtensionManifestKind::load(fs.clone(), extension_path)
             .await
             .unwrap();
 

@@ -12,7 +12,7 @@ use async_tar::Archive;
 use client::{Client, proto, telemetry::Telemetry};
 use cloud_api_types::{ExtensionMetadata, ExtensionProvides, GetExtensionsResponse};
 use collections::{BTreeMap, BTreeSet, HashSet, btree_map};
-pub use extension::ExtensionManifest;
+pub use extension::{ExtensionManifest, ExtensionManifestKind};
 use extension::extension_builder::{CompileExtensionOptions, ExtensionBuilder};
 use extension::{
     ExtensionContextServerProxy, ExtensionDebugAdapterProviderProxy, ExtensionEvents,
@@ -161,7 +161,7 @@ pub struct ExtensionIndex {
 
 #[derive(Clone, PartialEq, Eq, Debug, Deserialize, Serialize)]
 pub struct ExtensionIndexEntry {
-    pub manifest: Arc<ExtensionManifest>,
+    pub manifest: Arc<ExtensionManifestKind>,
     pub dev: bool,
 }
 
@@ -430,14 +430,14 @@ impl ExtensionStore {
         &self.extension_index.extensions
     }
 
-    pub fn dev_extensions(&self) -> impl Iterator<Item = &Arc<ExtensionManifest>> {
+    pub fn dev_extensions(&self) -> impl Iterator<Item = &Arc<ExtensionManifestKind>> {
         self.extension_index
             .extensions
             .values()
             .filter_map(|extension| extension.dev.then_some(&extension.manifest))
     }
 
-    pub fn extension_manifest_for_id(&self, extension_id: &str) -> Option<&Arc<ExtensionManifest>> {
+    pub fn extension_manifest_for_id(&self, extension_id: &str) -> Option<&Arc<ExtensionManifestKind>> {
         self.extension_index
             .extensions
             .get(extension_id)
@@ -566,7 +566,7 @@ impl ExtensionStore {
                             .extensions
                             .get(&extension.id)
                             .is_none_or(|installed_extension| {
-                                installed_extension.manifest.version != extension.manifest.version
+                                installed_extension.manifest.common().version != extension.manifest.version
                             })
                     })
                     .collect()
@@ -635,7 +635,7 @@ impl ExtensionStore {
                     this.extension_index.extensions.get(&extension.id)
                 {
                     let installed_version =
-                        Version::from_str(&installed_extension.manifest.version).ok()?;
+                        Version::from_str(&installed_extension.manifest.common().version).ok()?;
                     let latest_version = Version::from_str(&extension.manifest.version).ok()?;
 
                     if installed_version >= latest_version {
@@ -938,8 +938,8 @@ impl ExtensionStore {
 
         cx.spawn(async move |this, cx| {
             let mut extension_manifest =
-                ExtensionManifest::load(fs.clone(), &extension_source_path).await?;
-            let extension_id = extension_manifest.id.clone();
+                ExtensionManifestKind::load(fs.clone(), &extension_source_path).await?;
+            let extension_id = extension_manifest.common().id.clone();
 
             if let Some(uninstall_task) = this
                 .update(cx, |this, cx| {
@@ -982,7 +982,7 @@ impl ExtensionStore {
                         .compile_extension(
                             &extension_source_path,
                             &mut extension_manifest,
-                            CompileExtensionOptions::dev(),
+                            CompileExtensionOptions::dev(), // TODO
                             fs,
                         )
                         .await
@@ -1040,7 +1040,7 @@ impl ExtensionStore {
 
         cx.notify();
         let compile = cx.background_spawn(async move {
-            let mut manifest = ExtensionManifest::load(fs.clone(), &path).await?;
+            let mut manifest = ExtensionManifestKind::load(fs.clone(), &path).await?;
             builder
                 .compile_extension(&path, &mut manifest, CompileExtensionOptions::dev(), fs)
                 .await
@@ -1143,7 +1143,7 @@ impl ExtensionStore {
             .filter_map(|id| {
                 Some((
                     id.clone(),
-                    new_index.extensions.get(id)?.manifest.version.clone(),
+                    new_index.extensions.get(id)?.manifest.common().version.clone(),
                 ))
             })
             .collect::<Vec<_>>();
@@ -1189,8 +1189,8 @@ impl ExtensionStore {
             let Some(extension) = old_index.extensions.get(extension_id) else {
                 continue;
             };
-            grammars_to_remove.extend(extension.manifest.grammars.keys().cloned());
-            for (language_server_name, config) in &extension.manifest.language_servers {
+            grammars_to_remove.extend(extension.manifest.grammar_names().cloned());
+            for (language_server_name, config) in &extension.manifest.common().language_servers {
                 for language in config.languages() {
                     server_removal_tasks.push(self.proxy.remove_language_server(
                         &language,
@@ -1200,16 +1200,16 @@ impl ExtensionStore {
                 }
             }
 
-            for server_id in extension.manifest.context_servers.keys() {
+            for server_id in extension.manifest.common().context_servers.keys() {
                 self.proxy.unregister_context_server(server_id.clone(), cx);
             }
-            for adapter in extension.manifest.debug_adapters.keys() {
+            for adapter in extension.manifest.common().debug_adapters.keys() {
                 self.proxy.unregister_debug_adapter(adapter.clone());
             }
-            for locator in extension.manifest.debug_locators.keys() {
+            for locator in extension.manifest.common().debug_locators.keys() {
                 self.proxy.unregister_debug_locator(locator.clone());
             }
-            for command_name in extension.manifest.slash_commands.keys() {
+            for command_name in extension.manifest.common().slash_commands.keys() {
                 self.proxy.unregister_slash_command(command_name.clone());
             }
         }
@@ -1239,19 +1239,19 @@ impl ExtensionStore {
                 continue;
             };
 
-            grammars_to_add.extend(extension.manifest.grammars.keys().map(|grammar_name| {
+            grammars_to_add.extend(extension.manifest.grammar_names().map(|grammar_name| {
                 let mut grammar_path = self.installed_dir.clone();
                 grammar_path.extend([extension_id.as_ref(), "grammars"]);
                 grammar_path.push(grammar_name.as_ref());
                 grammar_path.set_extension("wasm");
                 (grammar_name.clone(), grammar_path)
             }));
-            themes_to_add.extend(extension.manifest.themes.iter().map(|theme_path| {
+            themes_to_add.extend(extension.manifest.common().themes.iter().map(|theme_path| {
                 let mut path = self.installed_dir.clone();
                 path.extend([Path::new(extension_id.as_ref()), theme_path.as_path()]);
                 path
             }));
-            icon_themes_to_add.extend(extension.manifest.icon_themes.iter().map(
+            icon_themes_to_add.extend(extension.manifest.common().icon_themes.iter().map(
                 |icon_theme_path| {
                     let mut path = self.installed_dir.clone();
                     path.extend([Path::new(extension_id.as_ref()), icon_theme_path.as_path()]);
@@ -1262,7 +1262,7 @@ impl ExtensionStore {
                     (path, icons_root_path)
                 },
             ));
-            snippets_to_add.extend(extension.manifest.snippets.iter().flat_map(|snippets| {
+            snippets_to_add.extend(extension.manifest.common().snippets.iter().flat_map(|snippets| {
                 snippets.paths().map(|snippets_path| {
                     let mut path = self.installed_dir.clone();
                     path.extend([Path::new(extension_id.as_ref()), snippets_path.as_path()]);
@@ -1382,11 +1382,11 @@ impl ExtensionStore {
 
             let mut wasm_extensions = Vec::new();
             for extension in extension_entries {
-                if extension.manifest.lib.kind.is_none() {
+                if extension.manifest.common().lib.kind.is_none() {
                     continue;
                 };
 
-                let extension_path = root_dir.join(extension.manifest.id.as_ref());
+                let extension_path = root_dir.join(extension.manifest.common().id.as_ref());
                 let wasm_extension = WasmExtension::load(
                     &extension_path,
                     &extension.manifest,
@@ -1403,11 +1403,11 @@ impl ExtensionStore {
                     Err(e) => {
                         log::error!(
                             "Failed to load extension: {}, {:#}",
-                            extension.manifest.id,
+                            extension.manifest.common().id,
                             e
                         );
                         this.update(cx, |_, cx| {
-                            cx.emit(Event::ExtensionFailedToLoad(extension.manifest.id.clone()))
+                            cx.emit(Event::ExtensionFailedToLoad(extension.manifest.common().id.clone()))
                         })
                         .ok();
                     }
@@ -1420,7 +1420,7 @@ impl ExtensionStore {
                 for (manifest, wasm_extension) in &wasm_extensions {
                     let extension = Arc::new(wasm_extension.clone());
 
-                    for (language_server_id, language_server_config) in &manifest.language_servers {
+                    for (language_server_id, language_server_config) in &manifest.common().language_servers {
                         for language in language_server_config.languages() {
                             this.proxy.register_language_server(
                                 extension.clone(),
@@ -1430,7 +1430,7 @@ impl ExtensionStore {
                         }
                     }
 
-                    for (slash_command_name, slash_command) in &manifest.slash_commands {
+                    for (slash_command_name, slash_command) in &manifest.common().slash_commands {
                         this.proxy.register_slash_command(
                             extension.clone(),
                             extension::SlashCommand {
@@ -1445,14 +1445,14 @@ impl ExtensionStore {
                         );
                     }
 
-                    for id in manifest.context_servers.keys() {
+                    for id in manifest.common().context_servers.keys() {
                         this.proxy
                             .register_context_server(extension.clone(), id.clone(), cx);
                     }
 
-                    for (debug_adapter, meta) in &manifest.debug_adapters {
+                    for (debug_adapter, meta) in &manifest.common().debug_adapters {
                         let mut path = root_dir.clone();
-                        path.push(Path::new(manifest.id.as_ref()));
+                        path.push(Path::new(manifest.common().id.as_ref()));
                         if let Some(schema_path) = &meta.schema_path {
                             path.push(schema_path);
                         } else {
@@ -1467,7 +1467,7 @@ impl ExtensionStore {
                         );
                     }
 
-                    for debug_adapter in manifest.debug_locators.keys() {
+                    for debug_adapter in manifest.common().debug_locators.keys() {
                         this.proxy
                             .register_debug_locator(extension.clone(), debug_adapter.clone());
                     }
@@ -1544,8 +1544,8 @@ impl ExtensionStore {
         index: &mut ExtensionIndex,
         proxy: Arc<ExtensionHostProxy>,
     ) -> Result<()> {
-        let mut extension_manifest = ExtensionManifest::load(fs.clone(), &extension_dir).await?;
-        let extension_id = extension_manifest.id.clone();
+        let mut extension_manifest = ExtensionManifestKind::load(fs.clone(), &extension_dir).await?;
+        let extension_id = extension_manifest.common().id.clone();
 
         if SUPPRESSED_EXTENSIONS.contains(&extension_id.as_ref()) {
             return Ok(());
@@ -1580,8 +1580,8 @@ impl ExtensionStore {
                 let config = ::toml::from_str::<LanguageConfig>(&config)?;
 
                 let relative_path = relative_path.to_path_buf();
-                if !extension_manifest.languages.contains(&relative_path) {
-                    extension_manifest.languages.push(relative_path.clone());
+                if !extension_manifest.common().languages.contains(&relative_path) {
+                    extension_manifest.common_mut().languages.push(relative_path.clone());
                 }
 
                 index.languages.insert(
@@ -1613,8 +1613,8 @@ impl ExtensionStore {
                 };
 
                 let relative_path = relative_path.to_path_buf();
-                if !extension_manifest.themes.contains(&relative_path) {
-                    extension_manifest.themes.push(relative_path.clone());
+                if !extension_manifest.common().themes.contains(&relative_path) {
+                    extension_manifest.common_mut().themes.push(relative_path.clone());
                 }
 
                 for theme_name in theme_families {
@@ -1645,8 +1645,8 @@ impl ExtensionStore {
                 };
 
                 let relative_path = relative_path.to_path_buf();
-                if !extension_manifest.icon_themes.contains(&relative_path) {
-                    extension_manifest.icon_themes.push(relative_path.clone());
+                if !extension_manifest.common().icon_themes.contains(&relative_path) {
+                    extension_manifest.common_mut().icon_themes.push(relative_path.clone());
                 }
 
                 for icon_theme_name in icon_theme_families {
@@ -1663,7 +1663,7 @@ impl ExtensionStore {
 
         let extension_wasm_path = extension_dir.join("extension.wasm");
         if fs.is_file(&extension_wasm_path).await {
-            extension_manifest
+            extension_manifest.common_mut()
                 .lib
                 .kind
                 .get_or_insert(ExtensionLibraryKind::Rust);
@@ -1672,8 +1672,8 @@ impl ExtensionStore {
         index.extensions.insert(
             extension_id.clone(),
             ExtensionIndexEntry {
-                dev: is_dev,
-                manifest: Arc::new(extension_manifest),
+                dev: is_dev, // TODO
+                manifest: Arc::new(extension_manifest.clone()),
             },
         );
 
@@ -1769,12 +1769,12 @@ impl ExtensionStore {
                 .extensions
                 .iter()
                 .filter_map(|(id, entry)| {
-                    if !entry.manifest.allow_remote_load() {
+                    if !entry.manifest.common().allow_remote_load() {
                         return None;
                     }
                     Some(proto::Extension {
                         id: id.to_string(),
-                        version: entry.manifest.version.to_string(),
+                        version: entry.manifest.common().version.to_string(),
                         dev: entry.dev,
                     })
                 })
